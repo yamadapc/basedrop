@@ -98,7 +98,7 @@ impl<T> Node<T> {
         let collector = (*node).header.link.collector;
         (*node).header.link.next = ManuallyDrop::new(AtomicPtr::new(core::ptr::null_mut()));
         let tail = (*collector).tail.swap(node as *mut NodeHeader, Ordering::AcqRel);
-        (*tail).link.next.store(node as *mut NodeHeader, Ordering::Relaxed);
+        (*tail).link.next.store(node as *mut NodeHeader, Ordering::Release);
     }
 
     /// Gets a [`Handle`] to this `Node`'s associated [`Collector`].
@@ -277,7 +277,7 @@ impl Collector {
                 self.head = next;
                 if head == self.stub {
                     (*head).link.next.store(core::ptr::null_mut(), Ordering::Relaxed);
-                    let tail = (*self.inner).tail.swap(head, Ordering::Release);
+                    let tail = (*self.inner).tail.swap(head, Ordering::AcqRel);
                     (*tail).link.next.store(head, Ordering::Relaxed);
                 } else {
                     ((*head).drop)(head);
