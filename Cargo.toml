@@ -1,10 +1,10 @@
 [package]
 name = "basedrop"
-version = "0.1.2"
-authors = ["Micah Johnston <micah@glowcoil.com>"]
+version = "0.1.3"
+authors = ["Micah Johnston <micahrjohnston@gmail.com>"]
 edition = "2018"
-description = "Memory-management tools for real-time audio and other latency-critical scenarios"
-repository = "https://github.com/glowcoil/basedrop"
+description = "Memory management tools for real-time audio and other latency-critical scenarios"
+repository = "https://github.com/micahrj/basedrop"
 readme = "README.md"
 license = "MIT/Apache-2.0"
 

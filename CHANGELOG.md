@@ -1,3 +1,7 @@
+# 0.1.3
+
+- Fix memory orderings in `Node::queue_drop` and `Collector::collect_one`.
+
 # 0.1.2
 
 - Fix bugs in implementation of SharedCell::new(), get(), and replace().
