@@ -15,7 +15,7 @@
 //! [`Node`]: crate::Node
 //! [`SharedCell`]: crate::SharedCell
 
-#![no_std]
+#![cfg_attr(not(all(feature = "loom", test)), no_std)]
 
 mod collector;
 mod owned;

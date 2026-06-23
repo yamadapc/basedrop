@@ -3,7 +3,11 @@ use crate::{Handle, Node};
 use core::marker::PhantomData;
 use core::ops::Deref;
 use core::ptr::NonNull;
+
+#[cfg(not(all(feature = "loom", test)))]
 use core::sync::atomic::{AtomicUsize, Ordering, fence};
+#[cfg(all(feature = "loom", test))]
+use loom::sync::atomic::{fence, AtomicUsize, Ordering};
 
 /// A reference-counted smart pointer with deferred collection, analogous to
 /// `Arc`.
@@ -111,7 +115,7 @@ impl<T> Drop for Shared<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use crate::{Collector, Shared};
 
@@ -160,5 +164,63 @@ mod tests {
 
         let _y = Shared::clone(&x);
         assert!(Shared::get_mut(&mut x).is_none());
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod tests {
+    use crate::{Collector, Shared};
+
+    use loom::sync::atomic::{AtomicUsize, Ordering};
+    use loom::sync::Arc;
+    use loom::thread;
+
+    struct Test(Arc<AtomicUsize>);
+
+    impl Drop for Test {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn shared_concurrent_clone_and_drop() {
+        loom::model(|| {
+            let mut collector = Collector::new();
+            let counter = Arc::new(AtomicUsize::new(0));
+            let shared = Arc::new(Shared::new(&collector.handle(), Test(counter.clone())));
+
+            let cloned = shared.clone();
+            let thread_counter = counter.clone();
+            let thread = thread::spawn(move || {
+                let copy = Shared::clone(&cloned);
+                assert_eq!(thread_counter.load(Ordering::Relaxed), 0);
+                drop(copy);
+            });
+
+            thread::yield_now();
+            assert_eq!(counter.load(Ordering::Relaxed), 0);
+            thread.join().unwrap();
+
+            drop(shared);
+            collector.collect();
+            assert_eq!(counter.load(Ordering::Relaxed), 1);
+        });
+    }
+
+    #[test]
+    fn shared_get_mut_observes_clones() {
+        loom::model(|| {
+            let collector = Collector::new();
+            let mut shared = Shared::new(&collector.handle(), 1);
+
+            *Shared::get_mut(&mut shared).unwrap() = 2;
+            assert_eq!(*shared, 2);
+
+            let copy = Shared::clone(&shared);
+            assert!(Shared::get_mut(&mut shared).is_none());
+            drop(copy);
+            assert_eq!(Shared::get_mut(&mut shared), Some(&mut 2));
+        });
     }
 }

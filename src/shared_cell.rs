@@ -2,7 +2,11 @@ use crate::{Node, Shared, SharedInner};
 
 use core::marker::PhantomData;
 use core::ptr::NonNull;
+
+#[cfg(not(all(feature = "loom", test)))]
 use core::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+#[cfg(all(feature = "loom", test))]
+use loom::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
 
 /// A thread-safe shared mutable memory location that holds a [`Shared<T>`].
 ///
@@ -114,7 +118,10 @@ impl<T> SharedCell<T> {
         core::mem::forget(value);
 
         let old = self.node.swap(node, Ordering::AcqRel);
-        while self.readers.load(Ordering::Relaxed) != 0 {}
+        while self.readers.load(Ordering::Relaxed) != 0 {
+            #[cfg(all(feature = "loom", test))]
+            loom::thread::yield_now();
+        }
         fence(Ordering::Acquire);
 
         Shared {
@@ -158,11 +165,12 @@ impl<T> Drop for SharedCell<T> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use crate::{Collector, Shared, SharedCell};
 
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::sync::atomic::AtomicUsize;
+    use core::sync::atomic::Ordering;
 
     #[test]
     fn shared_cell() {
@@ -201,5 +209,90 @@ mod tests {
         collector.collect();
 
         assert_eq!(counter.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn shared_cell_replace_sees_reader_clone() {
+        let collector = Collector::new();
+        let handle = collector.handle();
+
+        let old = Shared::new(&handle, 1);
+        let cell = SharedCell::new(old);
+
+        let reader = cell.get();
+        let new = Shared::new(&handle, 2);
+        let mut old = cell.replace(new);
+
+        assert!(Shared::get_mut(&mut old).is_none());
+        drop(reader);
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod tests {
+    use crate::{Collector, Shared, SharedCell};
+
+    use core::sync::atomic::Ordering;
+    use loom::sync::atomic::AtomicBool;
+    use loom::sync::Arc;
+    use loom::thread;
+
+    #[test]
+    fn shared_cell_replace_can_miss_a_concurrent_get_clone() {
+        struct Payload {
+            is_old: bool,
+        }
+
+        let mut builder = loom::model::Builder::new();
+        builder.max_branches = 100_000;
+        builder.preemption_bound = Some(3);
+
+        builder.check(|| {
+            let mut collector = Collector::new();
+            let handle = collector.handle();
+            let reader_has_old_shared = Arc::new(AtomicBool::new(false));
+            let writer_checked_old = Arc::new(AtomicBool::new(false));
+
+            let old = Shared::new(&handle, Payload { is_old: true });
+            let cell = Arc::new(SharedCell::new(old));
+
+            let reader_cell = cell.clone();
+            let reader_ready = reader_has_old_shared.clone();
+            let reader_done = writer_checked_old.clone();
+            let reader = thread::spawn(move || {
+                let value = reader_cell.get();
+                assert!(value.is_old);
+
+                // This is intentionally relaxed: it constrains the test schedule
+                // without repairing SharedCell's missing synchronization.
+                reader_ready.store(true, Ordering::Relaxed);
+                thread::yield_now();
+
+                // Keep `value` live until after the writer's uniqueness check in
+                // executions where the writer runs.
+                let _ = reader_done.load(Ordering::Relaxed);
+                drop(value);
+            });
+
+            thread::yield_now();
+
+            if reader_has_old_shared.load(Ordering::Relaxed) {
+                let new = Shared::new(&handle, Payload { is_old: false });
+                let mut old = cell.replace(new);
+
+                assert!(
+                    Shared::get_mut(&mut old).is_none(),
+                    "replace returned an old Shared that appeared unique while a reader still held a clone"
+                );
+
+                writer_checked_old.store(true, Ordering::Relaxed);
+                drop(old);
+            }
+
+            reader.join().unwrap();
+
+            drop(cell);
+            collector.collect();
+        });
     }
 }

@@ -341,7 +341,7 @@ impl Collector {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "loom")))]
 mod tests {
     use super::*;
 
@@ -409,5 +409,41 @@ mod tests {
 
         let result = collector.try_cleanup();
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "loom"))]
+mod tests {
+    use super::*;
+
+    use loom::thread;
+
+    #[test]
+    fn collector_collects_nodes_from_threads() {
+        loom::model(|| {
+            let mut collector = Collector::new();
+            let handle = collector.handle();
+
+            let thread_handle = handle.clone();
+            let thread = thread::spawn(move || {
+                let node = Node::alloc(&thread_handle, 1);
+                unsafe {
+                    Node::queue_drop(node);
+                }
+            });
+
+            let node = Node::alloc(&handle, 2);
+            unsafe {
+                Node::queue_drop(node);
+            }
+
+            thread.join().unwrap();
+            collector.collect();
+
+            assert_eq!(collector.alloc_count(), 0);
+
+            drop(handle);
+            assert!(collector.try_cleanup().is_ok());
+        });
     }
 }
