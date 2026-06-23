@@ -4,9 +4,12 @@ use core::marker::PhantomData;
 use core::ptr::NonNull;
 
 #[cfg(not(all(feature = "loom", test)))]
-use core::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 #[cfg(all(feature = "loom", test))]
-use loom::sync::atomic::{fence, AtomicPtr, AtomicUsize, Ordering};
+use loom::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+
+const WRITER: usize = 1 << (usize::BITS as usize - 1);
+const READER_MASK: usize = WRITER - 1;
 
 /// A thread-safe shared mutable memory location that holds a [`Shared<T>`].
 ///
@@ -63,7 +66,23 @@ impl<T> SharedCell<T> {
     ///
     /// [`Shared<T>`]: crate::Shared
     pub fn get(&self) -> Shared<T> {
-        self.readers.fetch_add(1, Ordering::SeqCst);
+        loop {
+            let readers = self.readers.load(Ordering::Acquire);
+            if readers & WRITER != 0 {
+                #[cfg(all(feature = "loom", test))]
+                loom::thread::yield_now();
+                continue;
+            }
+
+            assert!(readers < READER_MASK);
+            if self
+                .readers
+                .compare_exchange_weak(readers, readers + 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+        }
 
         let shared = Shared {
             node: unsafe { NonNull::new_unchecked(self.node.load(Ordering::SeqCst)) },
@@ -72,7 +91,7 @@ impl<T> SharedCell<T> {
         let copy = shared.clone();
         core::mem::forget(shared);
 
-        self.readers.fetch_sub(1, Ordering::Relaxed);
+        self.readers.fetch_sub(1, Ordering::AcqRel);
 
         copy
     }
@@ -117,12 +136,35 @@ impl<T> SharedCell<T> {
         let node = value.node.as_ptr();
         core::mem::forget(value);
 
-        let old = self.node.swap(node, Ordering::AcqRel);
-        while self.readers.load(Ordering::Relaxed) != 0 {
+        loop {
+            let readers = self.readers.load(Ordering::Acquire);
+            if readers & WRITER != 0 {
+                #[cfg(all(feature = "loom", test))]
+                loom::thread::yield_now();
+                continue;
+            }
+
+            if self
+                .readers
+                .compare_exchange_weak(
+                    readers,
+                    readers | WRITER,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                break;
+            }
+        }
+
+        while self.readers.load(Ordering::Acquire) != WRITER {
             #[cfg(all(feature = "loom", test))]
             loom::thread::yield_now();
         }
-        fence(Ordering::Acquire);
+
+        let old = self.node.swap(node, Ordering::AcqRel);
+        self.readers.store(0, Ordering::Release);
 
         Shared {
             node: unsafe { NonNull::new_unchecked(old) },
@@ -232,13 +274,11 @@ mod tests {
 mod tests {
     use crate::{Collector, Shared, SharedCell};
 
-    use core::sync::atomic::Ordering;
-    use loom::sync::atomic::AtomicBool;
-    use loom::sync::Arc;
+    use loom::sync::{Arc, Condvar, Mutex};
     use loom::thread;
 
     #[test]
-    fn shared_cell_replace_can_miss_a_concurrent_get_clone() {
+    fn shared_cell_replace_sees_concurrent_get_clone() {
         struct Payload {
             is_old: bool,
         }
@@ -250,44 +290,48 @@ mod tests {
         builder.check(|| {
             let mut collector = Collector::new();
             let handle = collector.handle();
-            let reader_has_old_shared = Arc::new(AtomicBool::new(false));
-            let writer_checked_old = Arc::new(AtomicBool::new(false));
+            let state = Arc::new((Mutex::new((false, false)), Condvar::new()));
 
             let old = Shared::new(&handle, Payload { is_old: true });
             let cell = Arc::new(SharedCell::new(old));
 
             let reader_cell = cell.clone();
-            let reader_ready = reader_has_old_shared.clone();
-            let reader_done = writer_checked_old.clone();
+            let reader_state = state.clone();
             let reader = thread::spawn(move || {
                 let value = reader_cell.get();
                 assert!(value.is_old);
 
-                // This is intentionally relaxed: it constrains the test schedule
-                // without repairing SharedCell's missing synchronization.
-                reader_ready.store(true, Ordering::Relaxed);
-                thread::yield_now();
+                let (lock, cvar) = &*reader_state;
+                let mut state = lock.lock().unwrap();
+                state.0 = true;
+                cvar.notify_one();
 
-                // Keep `value` live until after the writer's uniqueness check in
-                // executions where the writer runs.
-                let _ = reader_done.load(Ordering::Relaxed);
+                while !state.1 {
+                    state = cvar.wait(state).unwrap();
+                }
                 drop(value);
             });
 
-            thread::yield_now();
-
-            if reader_has_old_shared.load(Ordering::Relaxed) {
-                let new = Shared::new(&handle, Payload { is_old: false });
-                let mut old = cell.replace(new);
-
-                assert!(
-                    Shared::get_mut(&mut old).is_none(),
-                    "replace returned an old Shared that appeared unique while a reader still held a clone"
-                );
-
-                writer_checked_old.store(true, Ordering::Relaxed);
-                drop(old);
+            let (lock, cvar) = &*state;
+            let mut test_state = lock.lock().unwrap();
+            while !test_state.0 {
+                test_state = cvar.wait(test_state).unwrap();
             }
+            drop(test_state);
+
+            let new = Shared::new(&handle, Payload { is_old: false });
+            let mut old = cell.replace(new);
+
+            assert!(
+                Shared::get_mut(&mut old).is_none(),
+                "replace returned an old Shared that appeared unique while a reader still held a clone"
+            );
+
+            let mut test_state = lock.lock().unwrap();
+            test_state.1 = true;
+            cvar.notify_one();
+            drop(test_state);
+            drop(old);
 
             reader.join().unwrap();
 

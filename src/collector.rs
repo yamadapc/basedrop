@@ -97,8 +97,13 @@ impl<T> Node<T> {
     pub unsafe fn queue_drop(node: *mut Node<T>) {
         let collector = (*node).header.link.collector;
         (*node).header.link.next = ManuallyDrop::new(AtomicPtr::new(core::ptr::null_mut()));
-        let tail = (*collector).tail.swap(node as *mut NodeHeader, Ordering::AcqRel);
-        (*tail).link.next.store(node as *mut NodeHeader, Ordering::Relaxed);
+        let tail = (*collector)
+            .tail
+            .swap(node as *mut NodeHeader, Ordering::AcqRel);
+        (*tail)
+            .link
+            .next
+            .store(node as *mut NodeHeader, Ordering::Relaxed);
     }
 
     /// Gets a [`Handle`] to this `Node`'s associated [`Collector`].
@@ -139,7 +144,9 @@ impl Clone for Handle {
             (*self.collector).handles.fetch_add(1, Ordering::Relaxed);
         }
 
-        Handle { collector: self.collector }
+        Handle {
+            collector: self.collector,
+        }
     }
 }
 
@@ -209,7 +216,9 @@ impl Collector {
             (*self.inner).handles.fetch_add(1, Ordering::Relaxed);
         }
 
-        Handle { collector: self.inner }
+        Handle {
+            collector: self.inner,
+        }
     }
 
     /// Drops all of the garbage in the queue.
@@ -276,7 +285,10 @@ impl Collector {
                 let head = self.head;
                 self.head = next;
                 if head == self.stub {
-                    (*head).link.next.store(core::ptr::null_mut(), Ordering::Relaxed);
+                    (*head)
+                        .link
+                        .next
+                        .store(core::ptr::null_mut(), Ordering::Relaxed);
                     let tail = (*self.inner).tail.swap(head, Ordering::Release);
                     (*tail).link.next.store(head, Ordering::Relaxed);
                 } else {

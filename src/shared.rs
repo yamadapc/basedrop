@@ -5,7 +5,7 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 
 #[cfg(not(all(feature = "loom", test)))]
-use core::sync::atomic::{AtomicUsize, Ordering, fence};
+use core::sync::atomic::{fence, AtomicUsize, Ordering};
 #[cfg(all(feature = "loom", test))]
 use loom::sync::atomic::{fence, AtomicUsize, Ordering};
 
@@ -45,10 +45,13 @@ impl<T: Send + 'static> Shared<T> {
     pub fn new(handle: &Handle, data: T) -> Shared<T> {
         Shared {
             node: unsafe {
-                NonNull::new_unchecked(Node::alloc(handle, SharedInner {
-                    count: AtomicUsize::new(1),
-                    data,
-                }))
+                NonNull::new_unchecked(Node::alloc(
+                    handle,
+                    SharedInner {
+                        count: AtomicUsize::new(1),
+                        data,
+                    },
+                ))
             },
             phantom: PhantomData,
         }
@@ -87,10 +90,17 @@ impl<T> Shared<T> {
 impl<T> Clone for Shared<T> {
     fn clone(&self) -> Self {
         unsafe {
-            self.node.as_ref().data.count.fetch_add(1, Ordering::Relaxed);
+            self.node
+                .as_ref()
+                .data
+                .count
+                .fetch_add(1, Ordering::Relaxed);
         }
 
-        Shared { node: self.node, phantom: PhantomData }
+        Shared {
+            node: self.node,
+            phantom: PhantomData,
+        }
     }
 }
 
@@ -105,7 +115,12 @@ impl<T> Deref for Shared<T> {
 impl<T> Drop for Shared<T> {
     fn drop(&mut self) {
         unsafe {
-            let count = self.node.as_ref().data.count.fetch_sub(1, Ordering::Release);
+            let count = self
+                .node
+                .as_ref()
+                .data
+                .count
+                .fetch_sub(1, Ordering::Release);
 
             if count == 1 {
                 fence(Ordering::Acquire);
